@@ -1,0 +1,83 @@
+#Panda has the ability to read from S3 bucket
+import pandas as pd
+bucket = 'sagemakerdemo-2'
+file_name = 'sign_mnist_test.csv'
+data_location = 's3://{}/{}'.format(bucket, file_name)
+df = pd.read_csv(data_location)
+df = pd.read_csv('s3://sagemakerdemo-2/sign_mnist_test.csv')
+
+from matplotlib import pyplot as plt
+pic=df.head(1).values[0][1:].reshape((28,28))
+plt.imshow(pic, cmap='gray')
+plt.show()
+
+
+
+#To Use inbuilt Sagemaker algorithm we need to convert CSV format into RecordIO #protobuf format
+
+from sagemaker.amazon.common import write_numpy_to_dense_tensor
+import io
+from io import StringIO
+import boto3
+
+def convert_and_upload(pixs, labels, bucket_name, data_file):
+	buf = io.BytesIO()
+	write_numpy_to_dense_tensor(buf, pixs, labels)
+	buf.seek(0)
+
+	boto3.resource('s3').Bucket(bucket).Object(data_file).upload_fileobj(buf)
+
+pixels_train=df.drop('label', axis=1).values
+labels_train=df['label'].values
+
+convert_and_upload(pixels_train, labels_train, bucket, 'sign_mnist_train_rec')
+convert_and_upload(pixels_train, labels_train, bucket, 'sign_mnist_test_rec')
+
+
+#Training the Model using Knn algorithm
+import sagemaker
+from sagemaker import get_execution_role
+from sagemaker.amazon.amazon_estimator import get_image_uri
+knn=sagemaker.estimator.Estimator(get_image_uri(
+	boto3.Session().region_name,"knn"),
+	get_execution_role(),
+	train_instance_count=1,
+	train_instance_type='ml.m4.xlarge',
+	output_path='s3://{}/output'.format(bucket),
+	sagemaker_session=sagemaker.Session())
+
+knn.set_hyperparameters(**{
+	'k': 10,
+	'predictor_type': 'classifier',
+	'feature_dim': 784,
+	'sample_size': 27455
+})
+in_config_test = sagemaker.inputs.TrainingInput(
+	   s3_data='s3://{}/{}'.format(bucket,'sign_mnist_test_rec'))
+
+in_config_train = sagemaker.inputs.TrainingInput(
+	   s3_data='s3://{}/{}'.format(bucket,'sign_mnist_train_rec'))
+
+knn.fit({'train':in_config_train, 'test': in_config_test})
+
+
+
+#Deploying Model 
+import time
+
+def get_predictor(knn_estimator, estimator_name, instance_type, endpoint_name=None): 
+    knn_predictor = knn_estimator.deploy(initial_instance_count=1, instance_type=instance_type,
+                                        endpoint_name=endpoint_name)
+    knn_predictor.content_type = 'text/csv'
+    return knn_predictor
+
+
+instance_type = 'ml.m5.xlarge'
+model_name = 'knn_%s'% instance_type
+endpoint_name = 'knn-ml-%s'% (str(time.time()).replace('.','-'))
+predictor = get_predictor(knn, model_name, instance_type, endpoint_name=endpoint_name)
+
+
+#Invoking it 
+file = open("path_to_test_file.csv","rb")
+predictor.predict(file)
